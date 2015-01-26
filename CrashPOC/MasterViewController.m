@@ -29,12 +29,57 @@
     NSManagedObjectContext *backgroundContext       = [[NSManagedObjectContext alloc] initWithConcurrencyType:NSPrivateQueueConcurrencyType];
     
 #if USE_NESTED_CONTEXTS
-    backgroundContext.parentContext                 = self.managedObjectContext;
+    backgroundContext.parentContext                 = self.writerObjectContext;
 #else
     backgroundContext.persistentStoreCoordinator    = self.managedObjectContext.persistentStoreCoordinator;
 #endif
     
     self.backgroundContext                          = backgroundContext;
+
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserver:self selector:@selector(backgroundContextWillSave:) name:NSManagedObjectContextWillSaveNotification object:self.backgroundContext];
+    [nc addObserver:self selector:@selector(backgroundContextDidSave:) name:NSManagedObjectContextDidSaveNotification object:self.backgroundContext];
+}
+
+- (void)backgroundContextWillSave:(NSNotification *)note
+{
+    NSLog(@">> %@", NSStringFromSelector(_cmd));
+    
+    NSManagedObjectContext *workerContext = (NSManagedObjectContext *)note.object;
+
+    // Load the deleted object id's
+    NSMutableSet *workerDeletedIds = [NSMutableSet set];
+    for (NSManagedObject *object in workerContext.deletedObjects) {
+        [workerDeletedIds addObject:object.objectID];
+    }
+    
+    if (workerDeletedIds.count == 0) {
+        return;
+    }
+    
+    // Remove the objects from the mainContext
+    [self.writerObjectContext performBlockAndWait:^{
+        for (NSManagedObjectID *objectID in workerDeletedIds) {
+            NSManagedObject *writerMO = [self.writerObjectContext existingObjectWithID:objectID error:nil];
+            [self.writerObjectContext refreshObject:writerMO mergeChanges:false];
+            if (writerMO.isFault) {
+                [writerMO willAccessValueForKey:nil];
+            }
+        }
+    }];
+}
+
+- (void)backgroundContextDidSave:(NSNotification *)note
+{
+    NSLog(@">> %@", NSStringFromSelector(_cmd));
+
+    [self.writerObjectContext performBlockAndWait:^{
+        [self.writerObjectContext mergeChangesFromContextDidSaveNotification:note];
+    }];
+    
+    [self.managedObjectContext performBlockAndWait:^{
+        [self.managedObjectContext mergeChangesFromContextDidSaveNotification:note];
+    }];
 }
 
 - (void)insertNewObject:(id)sender
@@ -49,7 +94,7 @@
     
     [context obtainPermanentIDsForObjects:@[newManagedObject] error:nil];
     
-    NSLog(@"Inserting %@", newManagedObject.objectID.URIRepresentation);
+    NSLog(@"[Inserting]");
     [context save:nil];
     
     [self.writerObjectContext performBlockAndWait:^{
@@ -59,26 +104,24 @@
     // 2. Fetch
     [self.fetchedResultsController performFetch:nil];
 
-    // 3. Delete in background
-    [self.backgroundContext performBlockAndWait:^{
-        NSManagedObject *backgroundObject = [self.backgroundContext objectWithID:newManagedObject.objectID];
-        NSError *error = nil;
-        
-        NSLog(@"Deleting %@", backgroundObject.objectID.URIRepresentation);
-        
-        [self.backgroundContext deleteObject:backgroundObject];
-        [self.backgroundContext save:&error];
-        
-        if (error) {
-            NSLog(@"Error %@", error);
-        }
-    }];
-    
-    // 4. Fault the object
+    // 3. Fault the object
     [self.managedObjectContext refreshObject:newManagedObject mergeChanges:false];
     
+    // 4. Delete in BackgroundMOC
+    NSLog(@"[BeforeDelete] Fault: %d Deleted: %d", newManagedObject.isFault, newManagedObject.isDeleted);
+    
+    [self.backgroundContext performBlockAndWait:^{
+        NSManagedObject *backgroundObject = [self.backgroundContext objectWithID:newManagedObject.objectID];
+        
+        [self.backgroundContext deleteObject:backgroundObject];
+        [self.backgroundContext save:nil];
+    }];
+
+    NSLog(@"[AfterDelete] Fault: %d Deleted: %d", newManagedObject.isFault, newManagedObject.isDeleted);
+    
     // 5. Crash
-    NSLog(@"Timestamp: %@", newManagedObject.timeStamp);
+    NSLog(@"[Faulting] Timestamp: %@", newManagedObject.timeStamp);
+    NSLog(@"[Faulted] Fault: %d Deleted: %d", newManagedObject.isFault, newManagedObject.isDeleted);
 }
 
 
@@ -125,6 +168,7 @@
     NSFetchRequest *fetchRequest                    = [[NSFetchRequest alloc] init];
     fetchRequest.entity                             = [NSEntityDescription entityForName:@"Event" inManagedObjectContext:self.managedObjectContext];
     fetchRequest.fetchBatchSize                     = 20;
+    NSLog(@"Default %d", fetchRequest.returnsObjectsAsFaults);
     
     NSSortDescriptor *sortDescriptor                = [[NSSortDescriptor alloc] initWithKey:@"timeStamp" ascending:NO];
     
